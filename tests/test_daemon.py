@@ -900,3 +900,49 @@ class TestDaemonConfigReload:
             with pytest.raises(ValueError, match="not found"):
                 await daemon._ensure_server_connected("server-b")
             mock_load.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_invalid_edit_keeps_last_good_config_and_recovers(self, tmp_path):
+        """A transiently invalid config keeps last-good config and recovers later.
+
+        On a parse failure the daemon must not advance config_mtime, so a
+        subsequent valid edit at any mtime is still picked up (a half-written
+        file must not strand the daemon on stale config).
+        """
+        config_file = tmp_path / "mcp.json"
+        self._write_config(
+            config_file, {"server-a": {"command": "echo", "args": ["a"]}}
+        )
+        config = load_config(config_file)
+
+        with patch("mcp_launchpad.daemon.get_parent_pid", return_value=12345):
+            daemon = Daemon(config)
+
+        good_mtime = daemon.state.config_mtime
+
+        # User saves a half-written / invalid file
+        config_file.write_text("{ not valid json")
+        bad_mtime = good_mtime + 5
+        os.utime(config_file, (bad_mtime, bad_mtime))
+
+        daemon._reload_config_if_changed()
+
+        # Last-good config retained; mtime NOT advanced past the good load
+        assert "server-a" in daemon.state.config.servers
+        assert daemon.state.config_mtime == good_mtime
+
+        # User fixes the file (adds server-b)
+        self._write_config(
+            config_file,
+            {
+                "server-a": {"command": "echo", "args": ["a"]},
+                "server-b": {"command": "echo", "args": ["b"]},
+            },
+        )
+        fixed_mtime = good_mtime + 10
+        os.utime(config_file, (fixed_mtime, fixed_mtime))
+
+        daemon._reload_config_if_changed()
+
+        assert "server-b" in daemon.state.config.servers
+        assert daemon.state.config_mtime == fixed_mtime

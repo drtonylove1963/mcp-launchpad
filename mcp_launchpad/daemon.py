@@ -90,7 +90,7 @@ class DaemonState:
     running: bool = True
     last_activity: float = field(default_factory=time.time)
     ide_anchor: Path | None = None
-    config_mtime: float = 0.0  # mtime of config file when last loaded (issue #27)
+    config_mtime: float = 0.0  # mtime of config file when last loaded
 
 
 class Daemon:
@@ -601,10 +601,9 @@ class Daemon:
     def _reload_config_if_changed(self) -> None:
         """Reload config from disk if the config file changed since last load.
 
-        The daemon is long-lived and caches config at startup. If the user edits
-        their config file (e.g. adds a server) while the daemon is running, a
-        subsequent tool call would otherwise fail with "not found in
-        configuration" because the cached config is stale (issue #27).
+        The daemon is long-lived and caches config at startup. When the user
+        edits the config file (e.g. adds a server) while the daemon is running,
+        callers must see the change instead of failing against stale config.
 
         Only the config the daemon was started with (``config_path``) is tracked;
         already-connected servers are left untouched so existing sessions are not
@@ -621,10 +620,12 @@ class Daemon:
         try:
             new_config = load_config(config_path)
         except Exception as e:
-            # Keep serving the last-good config rather than crashing on a
-            # transiently invalid edit (e.g. a half-written file).
+            # Keep serving the last-good config on a transiently invalid edit
+            # (e.g. a half-written file). Deliberately do NOT advance
+            # config_mtime: an in-place writer may update mtime once at open
+            # time, so advancing here would strand us on stale config until the
+            # next edit. Retrying on each call is cheap (stat + small-JSON parse).
             logger.warning(f"Failed to reload config from {config_path}: {e}")
-            self.state.config_mtime = current_mtime
             return
 
         self.state.config = new_config

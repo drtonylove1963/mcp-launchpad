@@ -90,6 +90,7 @@ class DaemonState:
     running: bool = True
     last_activity: float = field(default_factory=time.time)
     ide_anchor: Path | None = None
+    config_mtime: float = 0.0  # mtime of config file when last loaded
 
 
 class Daemon:
@@ -101,6 +102,7 @@ class Daemon:
             parent_pid=get_parent_pid(),
             ide_anchor=get_ide_session_anchor(),
         )
+        self.state.config_mtime = self._get_config_mtime()
         self._ipc_server = create_ipc_server(self._handle_request)
         self._connection_tasks: dict[str, asyncio.Task[None]] = {}
 
@@ -586,8 +588,58 @@ class Daemon:
             logger.exception(f"Error handling request {action}")
             return IPCMessage(action="error", payload={"error": str(e)})
 
+    def _get_config_mtime(self) -> float:
+        """Return the mtime of the active config file, or 0.0 if unavailable."""
+        config_path = self.state.config.config_path
+        if config_path is None:
+            return 0.0
+        try:
+            return config_path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    def _reload_config_if_changed(self) -> None:
+        """Reload config from disk if the config file changed since last load.
+
+        The daemon is long-lived and caches config at startup. When the user
+        edits the config file (e.g. adds a server) while the daemon is running,
+        callers must see the change instead of failing against stale config.
+
+        Only the config the daemon was started with (``config_path``) is tracked;
+        already-connected servers are left untouched so existing sessions are not
+        disrupted. Newly added servers are connected lazily on first use.
+        """
+        config_path = self.state.config.config_path
+        if config_path is None:
+            return
+
+        current_mtime = self._get_config_mtime()
+        if current_mtime == 0.0 or current_mtime == self.state.config_mtime:
+            return
+
+        try:
+            new_config = load_config(config_path)
+        except Exception as e:
+            # Keep serving the last-good config on a transiently invalid edit
+            # (e.g. a half-written file). Deliberately do NOT advance
+            # config_mtime: an in-place writer may update mtime once at open
+            # time, so advancing here would strand us on stale config until the
+            # next edit. Retrying on each call is cheap (stat + small-JSON parse).
+            logger.warning(f"Failed to reload config from {config_path}: {e}")
+            return
+
+        self.state.config = new_config
+        self.state.config_mtime = current_mtime
+        logger.info(
+            f"Reloaded config from {config_path} "
+            f"({len(new_config.servers)} servers configured)"
+        )
+
     async def _ensure_server_connected(self, server_name: str) -> ServerState:
         """Ensure a server is connected, starting connection if needed."""
+        # Pick up edits to the config file made while the daemon is running.
+        self._reload_config_if_changed()
+
         if server_name not in self.state.config.servers:
             available = list(self.state.config.servers.keys())
             raise ValueError(

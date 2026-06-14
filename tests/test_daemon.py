@@ -1,5 +1,6 @@
 """Tests for session daemon."""
 
+import json
 import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -7,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from mcp_launchpad.config import Config, ServerConfig
+from mcp_launchpad.config import Config, ServerConfig, load_config
 from mcp_launchpad.connection import OAuthRequiredError
 from mcp_launchpad.daemon import Daemon, DaemonState, ServerState
 from mcp_launchpad.ipc import IPCMessage
@@ -829,3 +830,119 @@ class TestDaemonSSETransport:
             assert captured_headers is not None
             assert "Authorization" in captured_headers
             assert captured_headers["Authorization"] == "Bearer test-api-key"
+
+
+class TestDaemonConfigReload:
+    """Tests for daemon picking up config file changes (issue #27).
+
+    The daemon is long-lived and caches its config at startup. If the user
+    edits their config file (e.g. adds a server) while the daemon is running,
+    subsequent tool calls must reflect the change instead of failing with
+    "Server '<name>' not found in configuration".
+    """
+
+    def _write_config(self, path: Path, servers: dict[str, dict]) -> None:
+        path.write_text(json.dumps({"mcpServers": servers}))
+
+    @pytest.mark.asyncio
+    async def test_ensure_server_connected_reloads_added_server(self, tmp_path):
+        """A server added to the config file after startup is recognized."""
+        config_file = tmp_path / "mcp.json"
+        self._write_config(
+            config_file, {"server-a": {"command": "echo", "args": ["a"]}}
+        )
+        config = load_config(config_file)
+
+        with patch("mcp_launchpad.daemon.get_parent_pid", return_value=12345):
+            daemon = Daemon(config)
+
+        # server-b is not in the config the daemon started with
+        assert "server-b" not in daemon.state.config.servers
+
+        # User edits the config file to add server-b
+        self._write_config(
+            config_file,
+            {
+                "server-a": {"command": "echo", "args": ["a"]},
+                "server-b": {"command": "echo", "args": ["b"]},
+            },
+        )
+        # Advance mtime so the change is detectable regardless of fs resolution
+        future = os.stat(config_file).st_mtime + 10
+        os.utime(config_file, (future, future))
+
+        # Pre-seed server-b with an error so we don't actually connect (fast):
+        # if the config reloads correctly, _ensure_server_connected gets past the
+        # "not found" guard and surfaces the connection error instead.
+        daemon.state.servers["server-b"] = ServerState(
+            name="server-b", connected=False, error="connection boom"
+        )
+
+        with pytest.raises(RuntimeError, match="connection boom"):
+            await daemon._ensure_server_connected("server-b")
+
+        # Config now reflects the on-disk change
+        assert "server-b" in daemon.state.config.servers
+
+    @pytest.mark.asyncio
+    async def test_unchanged_config_is_not_reloaded(self, tmp_path):
+        """If the config file is unchanged, load_config is not re-invoked."""
+        config_file = tmp_path / "mcp.json"
+        self._write_config(
+            config_file, {"server-a": {"command": "echo", "args": ["a"]}}
+        )
+        config = load_config(config_file)
+
+        with patch("mcp_launchpad.daemon.get_parent_pid", return_value=12345):
+            daemon = Daemon(config)
+
+        with patch("mcp_launchpad.daemon.load_config") as mock_load:
+            with pytest.raises(ValueError, match="not found"):
+                await daemon._ensure_server_connected("server-b")
+            mock_load.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_invalid_edit_keeps_last_good_config_and_recovers(self, tmp_path):
+        """A transiently invalid config keeps last-good config and recovers later.
+
+        On a parse failure the daemon must not advance config_mtime, so a
+        subsequent valid edit at any mtime is still picked up (a half-written
+        file must not strand the daemon on stale config).
+        """
+        config_file = tmp_path / "mcp.json"
+        self._write_config(
+            config_file, {"server-a": {"command": "echo", "args": ["a"]}}
+        )
+        config = load_config(config_file)
+
+        with patch("mcp_launchpad.daemon.get_parent_pid", return_value=12345):
+            daemon = Daemon(config)
+
+        good_mtime = daemon.state.config_mtime
+
+        # User saves a half-written / invalid file
+        config_file.write_text("{ not valid json")
+        bad_mtime = good_mtime + 5
+        os.utime(config_file, (bad_mtime, bad_mtime))
+
+        daemon._reload_config_if_changed()
+
+        # Last-good config retained; mtime NOT advanced past the good load
+        assert "server-a" in daemon.state.config.servers
+        assert daemon.state.config_mtime == good_mtime
+
+        # User fixes the file (adds server-b)
+        self._write_config(
+            config_file,
+            {
+                "server-a": {"command": "echo", "args": ["a"]},
+                "server-b": {"command": "echo", "args": ["b"]},
+            },
+        )
+        fixed_mtime = good_mtime + 10
+        os.utime(config_file, (fixed_mtime, fixed_mtime))
+
+        daemon._reload_config_if_changed()
+
+        assert "server-b" in daemon.state.config.servers
+        assert daemon.state.config_mtime == fixed_mtime
